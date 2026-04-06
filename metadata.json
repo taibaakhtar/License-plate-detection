@@ -1,0 +1,5 @@
+{
+  "name": "LPD Dashboard",
+  "description": "Real-time License Plate Detection monitoring system with live streaming and detection logs.",
+  "requestFramePermissions": []
+}
