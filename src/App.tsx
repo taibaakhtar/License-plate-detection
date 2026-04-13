@@ -16,7 +16,9 @@ import {
   Upload,
   FileVideo,
   FileImage,
-  Loader2
+  Loader2,
+  Usb,
+  Link as LinkIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Detection, StreamStatus } from './types';
@@ -25,6 +27,7 @@ type Mode = 'stream' | 'upload';
 
 export default function App() {
   const [mode, setMode] = useState<Mode>('stream');
+  const [streamSource, setStreamSource] = useState<'url' | 'usb'>('url');
   const [streamUrl, setStreamUrl] = useState<string>('');
   const [apiUrl, setApiUrl] = useState<string>('https://trippingly-accusable-jaylene.ngrok-free.dev/detect/video');
   const [resolution, setResolution] = useState<string>('960');
@@ -36,20 +39,199 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [fileType, setFileType] = useState<'image' | 'video' | null>(null);
+  const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
+  const [isProcessingWebcam, setIsProcessingWebcam] = useState(false);
+  const [isInIframe, setIsInIframe] = useState(false);
+  const [permissionDenied, setPermissionDenied] = useState(false);
+  const [logs, setLogs] = useState<any[]>([]);
+  const [globalError, setGlobalError] = useState<{ message: string; type: 'error' | 'warning'; suggestion?: string } | null>(null);
+  const processingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  useEffect(() => {
+    setIsInIframe(window.self !== window.top);
+  }, []);
   
   const videoRef = useRef<HTMLImageElement>(null);
+  const webcamVideoRef = useRef<HTMLVideoElement>(null);
+  const processedImageRef = useRef<HTMLImageElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
   const filteredDetections = detections.filter(d => 
     d.plate.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const handleConnect = (e: FormEvent) => {
+  const handleConnect = async (e: FormEvent) => {
     e.preventDefault();
-    if (streamUrl) {
-      setStatus({ connected: true, fps: 24, latency: 120 });
-      setIsConfiguring(false);
-      setMode('stream');
+    
+    if (streamSource === 'url') {
+      if (streamUrl) {
+        setStatus({ connected: true, fps: 24, latency: 120 });
+        setIsConfiguring(false);
+        setMode('stream');
+      }
+    } else {
+      // USB Camera / Webcam mode
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("Your browser does not support webcam access or is blocking it.");
+        }
+
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 1280, height: 720 } 
+        });
+        setWebcamStream(stream);
+        setPermissionDenied(false);
+        setStatus({ connected: true, fps: 30, latency: 10 });
+        setIsConfiguring(false);
+        setMode('stream');
+        
+        // Attach stream to video element after it renders
+        setTimeout(() => {
+          if (webcamVideoRef.current) {
+            webcamVideoRef.current.srcObject = stream;
+          }
+        }, 100);
+      } catch (err) {
+        console.error("Error accessing webcam:", err);
+        const isPermissionError = err instanceof Error && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.message.includes('Permission denied'));
+        
+        if (isPermissionError) {
+          setPermissionDenied(true);
+          alert("Camera access was denied. \n\nIMPORTANT: Browsers block camera access in the preview pane. Please click the 'Open in new tab' button at the top right of the preview window to grant permissions.");
+        } else {
+          alert(`Could not access webcam: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
+      }
+    }
+  };
+
+  // Cleanup webcam stream and processing
+  useEffect(() => {
+    return () => {
+      if (webcamStream) {
+        webcamStream.getTracks().forEach(track => track.stop());
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+      if (processingIntervalRef.current) {
+        clearInterval(processingIntervalRef.current);
+      }
+    };
+  }, [webcamStream]);
+
+  const startWebcamStream = async () => {
+    // Derive WebSocket URL from API URL
+    // e.g., https://.../detect/video -> wss://.../ws/stream
+    const wsUrl = apiUrl.replace('http', 'ws').replace('/detect/video', '/ws/stream');
+    
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log("WebSocket connected");
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+
+        processingIntervalRef.current = setInterval(() => {
+          if (!webcamVideoRef.current || ws.readyState !== WebSocket.OPEN) return;
+
+          canvas.width = webcamVideoRef.current.videoWidth;
+          canvas.height = webcamVideoRef.current.videoHeight;
+          ctx?.drawImage(webcamVideoRef.current, 0, 0);
+
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+          ws.send(dataUrl);
+        }, 100); // ~10 FPS
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          const apiBaseUrl = apiUrl.split('/detect/video')[0];
+
+          // Show live frame
+          if (processedImageRef.current && data.frame) {
+            processedImageRef.current.src = data.frame;
+          }
+
+          // Show detections
+          if (data.detections?.length > 0) {
+            const newDetections: Detection[] = data.detections.map((d: any) => ({
+              id: d.id || Math.random().toString(36).substr(2, 9),
+              plate: d.plate || 'UNKNOWN',
+              bbox: d.bbox || [0, 0, 0, 0],
+              confidence: d.confidence || 0,
+              timestamp: new Date().toISOString(),
+              status: d.status || 'new'
+            }));
+            setDetections(prev => [...newDetections, ...prev].slice(0, 50));
+          }
+
+          // Show logs
+          if (data.logs?.length > 0) {
+            const newLogs = data.logs.map((file: string) => ({
+              url: `${apiBaseUrl}/logs/${file}`,
+              timestamp: new Date().toISOString()
+            }));
+            setLogs(prev => [...newLogs, ...prev].slice(0, 20));
+          }
+        } catch (err) {
+          // Fallback for non-JSON messages if any
+          if (processedImageRef.current) {
+            processedImageRef.current.src = event.data;
+          }
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        setGlobalError({
+          message: "WebSocket connection error",
+          type: "error",
+          suggestion: "Ensure the server is running and supports WebSockets at the derived URL. Check your network connection."
+        });
+        setIsProcessingWebcam(false);
+      };
+
+      ws.onclose = (event) => {
+        console.log("WebSocket disconnected", event.code, event.reason);
+        setIsProcessingWebcam(false);
+        if (processingIntervalRef.current) {
+          clearInterval(processingIntervalRef.current);
+          processingIntervalRef.current = null;
+        }
+        
+        if (event.code !== 1000 && event.code !== 1001) {
+          setGlobalError({
+            message: `WebSocket closed unexpectedly (Code: ${event.code})`,
+            type: "warning",
+            suggestion: "The connection was lost. This could be due to server timeout or network instability. Try restarting the analysis."
+          });
+        }
+      };
+    } catch (err) {
+      console.error("Failed to establish WebSocket connection:", err);
+      setIsProcessingWebcam(false);
+    }
+  };
+
+  const toggleWebcamAnalysis = () => {
+    if (isProcessingWebcam) {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      if (processingIntervalRef.current) {
+        clearInterval(processingIntervalRef.current);
+        processingIntervalRef.current = null;
+      }
+      setIsProcessingWebcam(false);
+    } else {
+      setIsProcessingWebcam(true);
+      startWebcamStream();
     }
   };
 
@@ -68,6 +250,7 @@ export default function App() {
     formData.append('resolution', resolution);
 
     try {
+      setGlobalError(null);
       const response = await fetch(apiUrl, {
         method: 'POST',
         headers: {
@@ -77,8 +260,18 @@ export default function App() {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Detection failed: ${response.status} ${errorText}`);
+        let errorMsg = `Detection failed: ${response.status} ${response.statusText}`;
+        let suggestion = "Check the server logs for more details.";
+        
+        if (response.status === 404) {
+          suggestion = "The API endpoint was not found. Verify the 'API Endpoint' in settings.";
+        } else if (response.status === 502 || response.status === 504) {
+          suggestion = "The server is unreachable or timed out. Check if your ngrok tunnel is still active.";
+        } else if (response.status === 403) {
+          suggestion = "Access forbidden. Ensure CORS is correctly configured on your backend.";
+        }
+
+        throw { message: errorMsg, suggestion };
       }
 
       const data = await response.json();
@@ -101,9 +294,13 @@ export default function App() {
       }
       
       setStatus({ connected: true, fps: 0, latency: 0 });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Upload error:', error);
-      alert(`Upload failed: ${error instanceof Error ? error.message : 'Unknown error'}. \n\nTip: Ensure your ngrok tunnel is active and CORS is enabled on the backend.`);
+      setGlobalError({
+        message: error.message || "Network request failed",
+        type: "error",
+        suggestion: error.suggestion || "Ensure your ngrok tunnel is active, the URL is correct, and your internet connection is stable."
+      });
       setStatus({ connected: false, fps: 0, latency: 0 });
       setIsConfiguring(true); // Return to config on error
     } finally {
@@ -114,6 +311,58 @@ export default function App() {
   return (
     <div className="min-h-screen bg-black text-white selection:bg-white selection:text-black flex flex-col overflow-hidden">
       <div className="scanline" />
+
+      {/* Global Notifications */}
+      <AnimatePresence>
+        {globalError && (
+          <motion.div 
+            initial={{ opacity: 0, y: -50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -50 }}
+            className="fixed top-20 left-1/2 -translate-x-1/2 z-[100] w-full max-w-md px-4"
+          >
+            <div className={`p-4 border ${globalError.type === 'error' ? 'border-red-600 bg-red-950/90' : 'border-amber-600 bg-amber-950/90'} backdrop-blur-md shadow-2xl`}>
+              <div className="flex items-start gap-3">
+                <AlertCircle className={`w-5 h-5 flex-shrink-0 ${globalError.type === 'error' ? 'text-red-500' : 'text-amber-500'}`} />
+                <div className="flex-1">
+                  <h3 className="text-xs font-bold uppercase tracking-widest mb-1">
+                    {globalError.type === 'error' ? 'System Error' : 'System Warning'}
+                  </h3>
+                  <p className="text-sm font-medium mb-2">{globalError.message}</p>
+                  {globalError.suggestion && (
+                    <p className="text-[10px] text-zinc-400 leading-relaxed font-mono uppercase tracking-tight">
+                      Suggestion: {globalError.suggestion}
+                    </p>
+                  )}
+                  <div className="mt-4 flex justify-end gap-3">
+                    <button 
+                      onClick={() => setGlobalError(null)}
+                      className="text-[10px] font-bold uppercase tracking-widest text-zinc-400 hover:text-white transition-colors"
+                    >
+                      Dismiss
+                    </button>
+                    <button 
+                      onClick={() => {
+                        setGlobalError(null);
+                        if (mode === 'stream' && streamSource === 'usb' && isProcessingWebcam) {
+                          toggleWebcamAnalysis();
+                          setTimeout(toggleWebcamAnalysis, 100);
+                        } else if (mode === 'upload') {
+                          // File upload retry is handled by user re-selecting file or clicking upload again
+                          setIsConfiguring(true);
+                        }
+                      }}
+                      className="text-[10px] font-bold uppercase tracking-widest text-white border border-white/20 px-3 py-1 hover:bg-white hover:text-black transition-all"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       
       {/* Header */}
       <header className="h-16 border-b border-zinc-800 flex items-center justify-between px-6 bg-black/80 backdrop-blur-md z-20">
@@ -171,28 +420,97 @@ export default function App() {
                 className="max-w-2xl w-full grid grid-cols-1 md:grid-cols-2 gap-6"
               >
                 {/* Stream Option */}
-                <div className="p-8 border border-zinc-800 bg-black">
-                  <div className="mb-8">
+                <div className="p-8 border border-zinc-800 bg-black flex flex-col">
+                  <div className="mb-6">
                     <h2 className="text-2xl font-bold tracking-tighter uppercase mb-2">Live Stream</h2>
-                    <p className="text-zinc-500 text-sm">Connect to a live MJPEG stream endpoint.</p>
+                    <p className="text-zinc-500 text-sm">Connect to a live video source for real-time detection.</p>
                   </div>
-                  <form onSubmit={handleConnect} className="space-y-4">
-                    <div className="space-y-2">
-                      <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">Stream URL</label>
-                      <input 
-                        type="url" 
-                        placeholder="https://.../video"
-                        className="w-full bg-zinc-900 border border-zinc-800 p-3 text-sm focus:outline-none focus:border-white transition-colors font-mono"
-                        value={streamUrl}
-                        onChange={(e) => setStreamUrl(e.target.value)}
-                      />
+
+                  {/* Source Toggle */}
+                  <div className="flex gap-2 mb-8 p-1 bg-zinc-900 border border-zinc-800 rounded-sm">
+                    <button 
+                      onClick={() => setStreamSource('url')}
+                      className={`flex-1 flex items-center justify-center gap-2 py-2 text-[10px] font-bold uppercase tracking-widest transition-all ${
+                        streamSource === 'url' ? 'bg-white text-black' : 'text-zinc-500 hover:text-white'
+                      }`}
+                    >
+                      <LinkIcon className="w-3 h-3" />
+                      Remote URL
+                    </button>
+                    <button 
+                      onClick={() => setStreamSource('usb')}
+                      className={`flex-1 flex items-center justify-center gap-2 py-2 text-[10px] font-bold uppercase tracking-widest transition-all ${
+                        streamSource === 'usb' ? 'bg-white text-black' : 'text-zinc-500 hover:text-white'
+                      }`}
+                    >
+                      <Usb className="w-3 h-3" />
+                      USB Camera
+                    </button>
+                  </div>
+
+                  <form onSubmit={handleConnect} className="space-y-4 flex-1 flex flex-col justify-between">
+                    <div className="space-y-4">
+                      {streamSource === 'url' ? (
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">Stream URL</label>
+                          <input 
+                            type="url" 
+                            placeholder="https://.../video"
+                            className="w-full bg-zinc-900 border border-zinc-800 p-3 text-sm focus:outline-none focus:border-white transition-colors font-mono"
+                            value={streamUrl}
+                            onChange={(e) => setStreamUrl(e.target.value)}
+                          />
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          <div className="p-4 border border-dashed border-zinc-800 bg-zinc-950 text-center">
+                            <Usb className="w-8 h-8 text-zinc-700 mx-auto mb-3" />
+                            <p className="text-xs text-zinc-500 uppercase tracking-widest font-bold mb-1">Local Device Detection</p>
+                            <p className="text-[10px] text-zinc-600 font-mono mb-2">System will attempt to bind to your webcam</p>
+                            
+                            {isInIframe && (
+                              <div className="mt-4 p-3 bg-red-900/20 border border-red-900/50 rounded-sm">
+                                <p className="text-[10px] text-red-400 font-bold uppercase tracking-tight mb-1">
+                                  <AlertCircle className="w-3 h-3 inline mr-1 mb-0.5" />
+                                  Iframe Restriction Detected
+                                </p>
+                                <p className="text-[9px] text-zinc-400 leading-tight">
+                                  Browsers block camera access in the preview pane. 
+                                  Please click the <span className="text-white font-bold">"Open in new tab"</span> button 
+                                  at the top right of this window to use your webcam.
+                                </p>
+                              </div>
+                            )}
+
+                            {permissionDenied && !isInIframe && (
+                              <div className="mt-4 p-3 bg-amber-900/20 border border-amber-900/50 rounded-sm">
+                                <p className="text-[10px] text-amber-400 font-bold uppercase tracking-tight mb-1">
+                                  <Shield className="w-3 h-3 inline mr-1 mb-0.5" />
+                                  Permission Blocked
+                                </p>
+                                <p className="text-[9px] text-zinc-400 leading-tight">
+                                  It looks like you previously blocked camera access. 
+                                  Please click the camera icon in your browser's address bar to reset permissions and try again.
+                                </p>
+                              </div>
+                            )}
+                            
+                            <input 
+                              type="hidden" 
+                              value="usb://0" 
+                              ref={(el) => { if(el && streamSource === 'usb') setStreamUrl('usb://0') }}
+                            />
+                          </div>
+                        </div>
+                      )}
                     </div>
+                    
                     <button 
                       type="submit"
-                      disabled={!streamUrl}
-                      className="w-full bg-white text-black font-bold py-3 uppercase tracking-tighter hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                      disabled={streamSource === 'url' && !streamUrl}
+                      className="w-full bg-white text-black font-bold py-3 mt-4 uppercase tracking-tighter hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
                     >
-                      Start Stream
+                      {streamSource === 'url' ? 'Start Stream' : 'Initialize USB Cam'}
                       <ChevronRight className="w-4 h-4" />
                     </button>
                   </form>
@@ -242,13 +560,32 @@ export default function App() {
 
                 {/* Media Display */}
                 {mode === 'stream' ? (
-                  <img 
-                    ref={videoRef}
-                    src={streamUrl || "https://picsum.photos/seed/traffic/1280/720"} 
-                    alt="Live Stream"
-                    className="w-full h-full object-cover opacity-80"
-                    referrerPolicy="no-referrer"
-                  />
+                  streamSource === 'url' ? (
+                    <img 
+                      ref={videoRef}
+                      src={streamUrl || "https://picsum.photos/seed/traffic/1280/720"} 
+                      alt="Live Stream"
+                      className="w-full h-full object-cover opacity-80"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <div className="relative w-full h-full flex items-center justify-center bg-black">
+                      <video
+                        ref={webcamVideoRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className={`w-full h-full object-cover transition-opacity duration-300 ${isProcessingWebcam ? 'opacity-0 absolute' : 'opacity-80'}`}
+                      />
+                      {isProcessingWebcam && (
+                        <img 
+                          ref={processedImageRef}
+                          alt="Processed Stream"
+                          className="w-full h-full object-cover opacity-90"
+                        />
+                      )}
+                    </div>
+                  )
                 ) : (
                   <div className="w-full h-full flex items-center justify-center bg-zinc-900">
                     {fileType === 'video' ? (
@@ -301,11 +638,36 @@ export default function App() {
 
                 {/* Stream Controls Overlay */}
                 <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                  {mode === 'stream' && streamSource === 'usb' && (
+                    <button 
+                      onClick={toggleWebcamAnalysis}
+                      className={`flex items-center gap-2 px-4 py-2 border font-bold text-[10px] uppercase tracking-widest transition-all ${
+                        isProcessingWebcam 
+                          ? 'bg-red-600 border-red-600 text-white hover:bg-red-700' 
+                          : 'bg-black/80 border-zinc-800 hover:bg-white hover:text-black'
+                      }`}
+                    >
+                      {isProcessingWebcam ? (
+                        <>
+                          <Activity className="w-3 h-3 animate-pulse" />
+                          Stop Analysis
+                        </>
+                      ) : (
+                        <>
+                          <Activity className="w-3 h-3" />
+                          Start Analysis
+                        </>
+                      )}
+                    </button>
+                  )}
                   <button className="p-2 bg-black/80 border border-zinc-800 hover:bg-white hover:text-black transition-all">
                     <Maximize2 className="w-4 h-4" />
                   </button>
                   <button 
-                    onClick={() => setIsConfiguring(true)}
+                    onClick={() => {
+                      if (isProcessingWebcam) toggleWebcamAnalysis();
+                      setIsConfiguring(true);
+                    }}
                     className="p-2 bg-black/80 border border-zinc-800 hover:bg-white hover:text-black transition-all"
                   >
                     <RefreshCcw className="w-4 h-4" />
@@ -421,6 +783,43 @@ export default function App() {
               )}
             </AnimatePresence>
           </div>
+
+          {/* Image Logs Section */}
+          {logs.length > 0 && (
+            <div className="h-64 border-t border-zinc-800 flex flex-col bg-zinc-950">
+              <div className="p-4 border-b border-zinc-900 flex items-center justify-between">
+                <h3 className="text-[10px] font-bold uppercase tracking-widest flex items-center gap-2">
+                  <Camera className="w-3 h-3" />
+                  Image Logs
+                </h3>
+                <span className="text-[9px] font-mono text-zinc-600 uppercase">{logs.length} Captured</span>
+              </div>
+              <div className="flex-1 overflow-x-auto p-4 flex gap-3 items-center scrollbar-hide">
+                <AnimatePresence>
+                  {logs.map((log, i) => (
+                    <motion.div
+                      key={log.url + i}
+                      initial={{ opacity: 0, scale: 0.8 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      className="flex-shrink-0 relative group"
+                    >
+                      <img
+                        src={log.url}
+                        alt={`Log ${i}`}
+                        className="w-32 aspect-video object-cover border border-zinc-800 group-hover:border-white transition-colors"
+                        referrerPolicy="no-referrer"
+                      />
+                      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                        <span className="text-[8px] font-mono uppercase tracking-tighter bg-black px-1">
+                          {new Date(log.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+            </div>
+          )}
         </aside>
       </main>
 
