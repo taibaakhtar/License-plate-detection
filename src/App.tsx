@@ -13,6 +13,7 @@ import {
   Trash2,
   RefreshCcw,
   ChevronRight,
+  ChevronLeft,
   Upload,
   FileVideo,
   FileImage,
@@ -34,6 +35,7 @@ export default function App() {
   const [isConfiguring, setIsConfiguring] = useState(true);
   const [detections, setDetections] = useState<Detection[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
   const [status, setStatus] = useState<StreamStatus>({ connected: false, fps: 0, latency: 0 });
   const [showSettings, setShowSettings] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -60,6 +62,19 @@ export default function App() {
   const filteredDetections = detections.filter(d => 
     d.plate.toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  const ITEMS_PER_PAGE = 5;
+  const totalPages = Math.max(1, Math.ceil(filteredDetections.length / ITEMS_PER_PAGE));
+  const paginatedDetections = filteredDetections.slice(
+    (currentPage - 1) * ITEMS_PER_PAGE,
+    currentPage * ITEMS_PER_PAGE
+  );
+
+  useEffect(() => {
+    if (currentPage > totalPages && totalPages > 0) {
+      setCurrentPage(totalPages);
+    }
+  }, [totalPages, currentPage]);
 
   const handleConnect = async (e: FormEvent) => {
     e.preventDefault();
@@ -138,11 +153,14 @@ export default function App() {
         processingIntervalRef.current = setInterval(() => {
           if (!webcamVideoRef.current || ws.readyState !== WebSocket.OPEN) return;
 
-          canvas.width = webcamVideoRef.current.videoWidth;
-          canvas.height = webcamVideoRef.current.videoHeight;
-          ctx?.drawImage(webcamVideoRef.current, 0, 0);
+          const video = webcamVideoRef.current;
+          // Ensure we use the actual video source dimensions to prevent "zooming"
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx?.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-          const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+          // Lower quality slightly (0.6) to reduce latency
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
           ws.send(dataUrl);
         }, 100); // ~10 FPS
       };
@@ -565,7 +583,7 @@ export default function App() {
                       ref={videoRef}
                       src={streamUrl || "https://picsum.photos/seed/traffic/1280/720"} 
                       alt="Live Stream"
-                      className="w-full h-full object-cover opacity-80"
+                      className="w-full h-full object-contain opacity-80"
                       referrerPolicy="no-referrer"
                     />
                   ) : (
@@ -575,13 +593,13 @@ export default function App() {
                         autoPlay
                         playsInline
                         muted
-                        className={`w-full h-full object-cover transition-opacity duration-300 ${isProcessingWebcam ? 'opacity-0 absolute' : 'opacity-80'}`}
+                        className={`w-full h-full object-contain transition-opacity duration-300 ${isProcessingWebcam ? 'opacity-0 absolute' : 'opacity-80'}`}
                       />
                       {isProcessingWebcam && (
                         <img 
                           ref={processedImageRef}
                           alt="Processed Stream"
-                          className="w-full h-full object-cover opacity-90"
+                          className="w-full h-full object-contain opacity-90"
                         />
                       )}
                     </div>
@@ -733,15 +751,18 @@ export default function App() {
                 placeholder="Search Plate ID..."
                 className="w-full bg-zinc-900 border border-zinc-800 pl-10 pr-4 py-2 text-sm focus:outline-none focus:border-white transition-colors font-mono"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setCurrentPage(1);
+                }}
               />
             </div>
           </div>
 
           <div className="flex-1 overflow-y-auto">
             <AnimatePresence initial={false}>
-              {filteredDetections.length > 0 ? (
-                filteredDetections.map((d) => (
+              {paginatedDetections.length > 0 ? (
+                paginatedDetections.map((d) => (
                   <motion.div
                     key={d.id}
                     initial={{ opacity: 0, x: 20 }}
@@ -783,6 +804,29 @@ export default function App() {
               )}
             </AnimatePresence>
           </div>
+
+          {/* Pagination Controls */}
+          {filteredDetections.length > ITEMS_PER_PAGE && (
+            <div className="p-4 border-t border-zinc-800 flex items-center justify-between bg-zinc-950">
+              <button 
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+                className="p-2 border border-zinc-800 hover:bg-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent transition-colors text-white"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">
+                Page {currentPage} of {totalPages}
+              </span>
+              <button 
+                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                disabled={currentPage === totalPages}
+                className="p-2 border border-zinc-800 hover:bg-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent transition-colors text-white"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          )}
 
           {/* Image Logs Section */}
           {logs.length > 0 && (
